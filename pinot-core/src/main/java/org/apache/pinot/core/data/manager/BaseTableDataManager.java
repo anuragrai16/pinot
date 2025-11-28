@@ -426,15 +426,16 @@ public abstract class BaseTableDataManager implements TableDataManager {
 
   /**
    * Replaces an already loaded segment in a table if the segment has been overridden in the deep store (CRC mismatch).
+   * Accepts a flag to indicate whether to use data CRC (if available) for comparison instead of the default index CRC.
    */
   protected void replaceSegmentIfCrcMismatch(SegmentDataManager segmentDataManager, SegmentZKMetadata zkMetadata,
-      IndexLoadingConfig indexLoadingConfig)
+      IndexLoadingConfig indexLoadingConfig, boolean useDataCrcIfAvailable)
       throws Exception {
     String segmentName = segmentDataManager.getSegmentName();
     Preconditions.checkState(segmentDataManager instanceof ImmutableSegmentDataManager,
         "Cannot replace CONSUMING segment: %s in table: %s", segmentName, _tableNameWithType);
     SegmentMetadata localMetadata = segmentDataManager.getSegment().getSegmentMetadata();
-    if (hasSameCRC(zkMetadata, localMetadata)) {
+    if (hasSameCRC(zkMetadata, localMetadata, useDataCrcIfAvailable)) {
       _logger.info("Segment: {} has CRC: {} same as before, not replacing it", segmentName, localMetadata.getCrc());
       return;
     }
@@ -518,7 +519,7 @@ public abstract class BaseTableDataManager implements TableDataManager {
       indexLoadingConfig.setSegmentTier(zkMetadata.getTier());
       _segmentReloadSemaphore.acquire(segmentName, _logger);
       try {
-        replaceSegmentIfCrcMismatch(segmentDataManager, zkMetadata, indexLoadingConfig);
+        replaceSegmentIfCrcMismatch(segmentDataManager, zkMetadata, indexLoadingConfig, false);
       } finally {
         _segmentReloadSemaphore.release();
       }
@@ -867,7 +868,7 @@ public abstract class BaseTableDataManager implements TableDataManager {
       - Continue loading the segment from the index directory.
       */
       boolean shouldDownload =
-          forceDownload || (isSegmentStatusCompleted(zkMetadata) && !hasSameCRC(zkMetadata, localMetadata)
+          forceDownload || (isSegmentStatusCompleted(zkMetadata) && !hasSameCRC(zkMetadata, localMetadata, false)
               && _instanceDataManagerConfig.shouldCheckCRCOnSegmentLoad());
       if (shouldDownload) {
         // Create backup directory to handle failure of segment reloading.
@@ -1264,7 +1265,8 @@ public abstract class BaseTableDataManager implements TableDataManager {
     If:
     1. The segment doesn't exist on the server, or
     2. The segment status is marked as "DONE" in ZK metadata but there's a CRC mismatch
-       between the ZK metadata and the local metadata CRC.
+       between the ZK metadata and the local metadata CRC. If data crc is available, it will be used
+       to compare the segments.
        - The "DONE" status confirms the COMMIT_END_METADATA call succeeded,
          and the segment is available either in deep storage or with a peer
          before discarding the local copy.
@@ -1278,9 +1280,13 @@ public abstract class BaseTableDataManager implements TableDataManager {
       closeSegmentDirectoryQuietly(segmentDirectory);
       return false;
     }
-    if (isSegmentStatusCompleted(zkMetadata) && !hasSameCRC(zkMetadata, segmentMetadata)) {
-      _logger.warn("Segment: {} has CRC changed from: {} to: {}", segmentName, segmentMetadata.getCrc(),
-          zkMetadata.getCrc());
+    if (isSegmentStatusCompleted(zkMetadata) && !hasSameCRC(zkMetadata, segmentMetadata, true)) {
+      _logger.warn("Segment: {} has CRC changed from: {} to: {} and data CRC prev value: {} new value: {}",
+          segmentName,
+          segmentMetadata.getCrc(),
+          zkMetadata.getCrc(),
+          segmentMetadata.getDataCrc(),
+          zkMetadata.getDataCrc());
       if (_instanceDataManagerConfig.shouldCheckCRCOnSegmentLoad()) {
         closeSegmentDirectoryQuietly(segmentDirectory);
         return false;
@@ -1655,8 +1661,17 @@ public abstract class BaseTableDataManager implements TableDataManager {
     return segmentDirectoryLoader.load(indexDir.toURI(), loaderContext);
   }
 
-  private static boolean hasSameCRC(SegmentZKMetadata zkMetadata, SegmentMetadata localMetadata) {
-    return zkMetadata.getCrc() == Long.parseLong(localMetadata.getCrc());
+  // CRC check can be performed on both segment CRC and data CRC (if available) based on the flag passed
+  private static boolean hasSameCRC(SegmentZKMetadata zkMetadata, SegmentMetadata localMetadata,
+      boolean useDataCrcIfAvailable) {
+    if (zkMetadata.getCrc() == Long.parseLong(localMetadata.getCrc())) {
+      return true;
+    } else if (useDataCrcIfAvailable) {
+      return zkMetadata.getDataCrc() >= 0
+          && Long.parseLong(localMetadata.getDataCrc()) >= 0
+          && zkMetadata.getDataCrc() == Long.parseLong(localMetadata.getDataCrc());
+    }
+    return false;
   }
 
   private static void recoverReloadFailureQuietly(String tableNameWithType, String segmentName, File indexDir) {
