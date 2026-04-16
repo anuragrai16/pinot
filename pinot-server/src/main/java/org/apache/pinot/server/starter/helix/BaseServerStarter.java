@@ -85,6 +85,7 @@ import org.apache.pinot.core.data.manager.InstanceDataManager;
 import org.apache.pinot.core.data.manager.realtime.RealtimeConsumptionRateManager;
 import org.apache.pinot.core.data.manager.realtime.ServerRateLimitConfigChangeListener;
 import org.apache.pinot.core.instance.context.ServerContext;
+import org.apache.pinot.core.query.killing.QueryKillingManager;
 import org.apache.pinot.core.query.scheduler.resources.ResourceManager;
 import org.apache.pinot.core.transport.ListenerConfig;
 import org.apache.pinot.core.transport.NettyInspector;
@@ -186,6 +187,7 @@ public abstract class BaseServerStarter implements ServiceStartable {
   protected PinotEnvironmentProvider _pinotEnvironmentProvider;
   protected SegmentOperationsThrottlerSet _segmentOperationsThrottlerSet;
   protected ThreadAccountant _threadAccountant;
+  protected QueryKillingManager _queryKillingManager;
   protected DefaultClusterConfigChangeHandler _clusterConfigChangeHandler;
   protected volatile boolean _isServerReadyToServeQueries = false;
   protected ScheduledExecutorService _helixMessageCountScheduler;
@@ -756,6 +758,9 @@ public abstract class BaseServerStarter implements ServiceStartable {
     _threadAccountant = ThreadAccountantUtils.createAccountant(schedulerConfig, _instanceId,
         org.apache.pinot.spi.config.instance.InstanceType.SERVER);
 
+    // Initialize scan-based query killing (independent of accounting factory)
+    _queryKillingManager = QueryKillingManager.init(schedulerConfig, ServerMetrics.get());
+
     SendStatsPredicate sendStatsPredicate = SendStatsPredicate.create(_serverConf, _helixManager);
     KeepPipelineBreakerStatsPredicate keepPipelineBreakerStatsPredicate =
         KeepPipelineBreakerStatsPredicate.create(_serverConf);
@@ -879,6 +884,10 @@ public abstract class BaseServerStarter implements ServiceStartable {
     PinotClusterConfigChangeListener threadAccountantListener = _threadAccountant.getClusterConfigChangeListener();
     if (threadAccountantListener != null) {
       _clusterConfigChangeHandler.registerClusterConfigChangeListener(threadAccountantListener);
+    }
+    // Register query killing manager for dynamic config updates (threshold changes, mode changes)
+    if (_queryKillingManager != null) {
+      _clusterConfigChangeHandler.registerClusterConfigChangeListener(_queryKillingManager);
     }
 
     // Start the query server after finishing the service status check. If the query server is started before all the

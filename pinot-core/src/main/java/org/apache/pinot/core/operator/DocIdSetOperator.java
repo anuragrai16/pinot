@@ -21,6 +21,7 @@ package org.apache.pinot.core.operator;
 import com.google.common.base.Preconditions;
 import java.util.Collections;
 import java.util.List;
+import javax.annotation.Nullable;
 import org.apache.pinot.core.common.BlockDocIdIterator;
 import org.apache.pinot.core.common.BlockDocIdSet;
 import org.apache.pinot.core.common.Operator;
@@ -28,6 +29,7 @@ import org.apache.pinot.core.operator.blocks.DocIdSetBlock;
 import org.apache.pinot.core.operator.filter.BaseFilterOperator;
 import org.apache.pinot.core.plan.DocIdSetPlanNode;
 import org.apache.pinot.segment.spi.Constants;
+import org.apache.pinot.spi.query.QueryScanCostContext;
 import org.apache.pinot.spi.query.QueryThreadContext;
 
 
@@ -49,6 +51,7 @@ public class DocIdSetOperator extends BaseDocIdSetOperator {
   private BlockDocIdSet _blockDocIdSet;
   private BlockDocIdIterator _blockDocIdIterator;
   private int _currentDocId = 0;
+  private long _lastReportedEntriesScanned;
 
   public DocIdSetOperator(BaseFilterOperator filterOperator, int maxSizeOfDocIdSet) {
     Preconditions.checkArgument(maxSizeOfDocIdSet > 0 && maxSizeOfDocIdSet <= DocIdSetPlanNode.MAX_DOC_PER_CALL);
@@ -79,6 +82,20 @@ public class DocIdSetOperator extends BaseDocIdSetOperator {
       }
       docIds[pos++] = _currentDocId;
     }
+
+    // Push scan cost delta for proactive query killing
+    if (_blockDocIdSet != null) {
+      QueryScanCostContext scanCost = getScanCostContext();
+      if (scanCost != null) {
+        long currentTotal = _blockDocIdSet.getNumEntriesScannedInFilter();
+        long delta = currentTotal - _lastReportedEntriesScanned;
+        if (delta > 0) {
+          scanCost.addEntriesScannedInFilter(delta);
+          _lastReportedEntriesScanned = currentTotal;
+        }
+      }
+    }
+
     if (pos > 0) {
       return new DocIdSetBlock(docIds, pos);
     } else {
@@ -106,6 +123,12 @@ public class DocIdSetOperator extends BaseDocIdSetOperator {
   public ExecutionStatistics getExecutionStatistics() {
     long numEntriesScannedInFilter = _blockDocIdSet != null ? _blockDocIdSet.getNumEntriesScannedInFilter() : 0;
     return new ExecutionStatistics(0, numEntriesScannedInFilter, 0, 0);
+  }
+
+  @Nullable
+  private static QueryScanCostContext getScanCostContext() {
+    QueryThreadContext ctx = QueryThreadContext.getIfAvailable();
+    return ctx != null ? ctx.getExecutionContext().getQueryScanCostContext() : null;
   }
 
   @Override

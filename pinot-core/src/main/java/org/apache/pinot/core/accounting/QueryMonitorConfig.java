@@ -155,7 +155,8 @@ public class QueryMonitorConfig {
         (String) null);
   }
 
-  QueryMonitorConfig(QueryMonitorConfig oldConfig, Set<String> changedConfigs, Map<String, String> clusterConfigs) {
+  public QueryMonitorConfig(QueryMonitorConfig oldConfig, Set<String> changedConfigs,
+      Map<String, String> clusterConfigs) {
     _maxHeapSize = oldConfig._maxHeapSize;
 
     if (changedConfigs.contains(CommonConstants.Accounting.CONFIG_OF_MIN_MEMORY_FOOTPRINT_TO_KILL_RATIO)) {

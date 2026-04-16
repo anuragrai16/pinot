@@ -402,13 +402,64 @@ public class QueryRunner {
         return _timeSeriesPhysicalPlanVisitor.compile(x, context);
       }).collect(Collectors.toList());
       // Run the operator using the same executor service as OpChainSchedulerService
+      final String requestId = metadata.getOrDefault(Request.MetadataKeys.REQUEST_ID, "unknown");
       _executorService.submit(() -> {
         String currentPlanId = "";
         try {
           for (int index = 0; index < fragmentOpChains.size(); index++) {
             currentPlanId = fragmentRoots.get(index).getId();
             BaseTimeSeriesOperator fragmentOpChain = fragmentOpChains.get(index);
+            // #region agent log
+            long fragmentStartMs = System.currentTimeMillis();
+            // #endregion
             TimeSeriesBlock seriesBlock = fragmentOpChain.nextBlock();
+            // #region agent log
+            long fragmentEndMs = System.currentTimeMillis();
+            try {
+              StringBuilder dataSb = new StringBuilder();
+              dataSb.append("{\"fragmentIndex\":").append(index);
+              dataSb.append(",\"planId\":\"").append(currentPlanId).append("\"");
+              dataSb.append(",\"requestId\":\"").append(requestId).append("\"");
+              dataSb.append(",\"startMs\":").append(fragmentStartMs);
+              dataSb.append(",\"endMs\":").append(fragmentEndMs);
+              dataSb.append(",\"durationMs\":").append(fragmentEndMs - fragmentStartMs);
+              dataSb.append(",\"numSeries\":").append(seriesBlock.getSeriesMap().size());
+              double totalSum = 0;
+              int totalDataPoints = 0;
+              Double lastBucketMax = null;
+              for (var seriesEntry : seriesBlock.getSeriesMap().entrySet()) {
+                for (org.apache.pinot.tsdb.spi.series.TimeSeries ts : seriesEntry.getValue()) {
+                  Double[] vals = ts.getDoubleValues();
+                  for (int vi = 0; vi < vals.length; vi++) {
+                    if (vals[vi] != null) {
+                      totalSum += vals[vi];
+                      totalDataPoints++;
+                      if (vi == vals.length - 1) {
+                        lastBucketMax = (lastBucketMax == null) ? vals[vi] : Math.max(lastBucketMax, vals[vi]);
+                      }
+                    }
+                  }
+                }
+              }
+              dataSb.append(",\"totalSum\":").append(totalSum);
+              dataSb.append(",\"totalDataPoints\":").append(totalDataPoints);
+              dataSb.append(",\"lastBucketMax\":").append(lastBucketMax);
+              dataSb.append(",\"operatorName\":\"").append(fragmentOpChain.getExplainName()).append("\"");
+              dataSb.append("}");
+              String logLine = "{\"sessionId\":\"36d59f\",\"id\":\"srv_frag_" + System.nanoTime() + "\","
+                  + "\"timestamp\":" + fragmentEndMs + ","
+                  + "\"location\":\"QueryRunner.java:processTimeSeriesQuery\","
+                  + "\"message\":\"Server fragment execution\","
+                  + "\"data\":" + dataSb
+                  + ",\"hypothesisId\":\"H1_H3\"}";
+              try (java.io.FileWriter fw = new java.io.FileWriter(
+                  "/Users/anurag.rai/Uber/anuragrai16/pinot/.cursor/debug-36d59f.log", true)) {
+                fw.write(logLine + "\n");
+              }
+            } catch (Throwable logErr) {
+              LOGGER.debug("Debug log write failed", logErr);
+            }
+            // #endregion
             Map<String, String> metadataMap = new HashMap<>(seriesBlock.getMetadata());
             metadataMap.put(Response.MetadataKeys.TimeSeries.PLAN_ID, currentPlanId);
             TimeSeriesBlockSerde.encodeExceptionsToMetadata(seriesBlock, metadataMap);

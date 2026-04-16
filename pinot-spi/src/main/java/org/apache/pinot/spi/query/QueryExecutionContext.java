@@ -65,6 +65,16 @@ public class QueryExecutionContext {
 
   private volatile TerminationException _terminateException;
 
+  // Scan-based query killing (set per-query when killing is enabled)
+  @Nullable
+  private QueryScanCostContext _queryScanCostContext;
+  @Nullable
+  private Object _cachedKillingStrategy;
+  @Nullable
+  private String _tableName;
+  @Nullable
+  private String _queryId;
+
   public QueryExecutionContext(QueryType queryType, long requestId, String cid, String workloadName, long startTimeMs,
       long activeDeadlineMs, long passiveDeadlineMs, String brokerId, String instanceId, String queryHash) {
     _queryType = queryType;
@@ -192,5 +202,42 @@ public class QueryExecutionContext {
   @Nullable
   public TerminationException getTerminateException() {
     return _terminateException;
+  }
+
+  public void setQueryScanCostContext(@Nullable QueryScanCostContext queryScanCostContext) {
+    _queryScanCostContext = queryScanCostContext;
+  }
+
+  @Nullable
+  public QueryScanCostContext getQueryScanCostContext() {
+    return _queryScanCostContext;
+  }
+
+  /// Caches the per-query killing strategy (resolved via forQuery() with table overrides).
+  public void setCachedKillingStrategy(@Nullable Object cachedKillingStrategy) {
+    _cachedKillingStrategy = cachedKillingStrategy;
+  }
+
+  @Nullable
+  public Object getCachedKillingStrategy() {
+    return _cachedKillingStrategy;
+  }
+
+  public void setTableName(@Nullable String tableName) {
+    _tableName = tableName;
+  }
+
+  @Nullable
+  public String getTableName() {
+    return _tableName;
+  }
+
+  public void setQueryId(@Nullable String queryId) {
+    _queryId = queryId;
+  }
+
+  @Nullable
+  public String getQueryId() {
+    return _queryId;
   }
 }

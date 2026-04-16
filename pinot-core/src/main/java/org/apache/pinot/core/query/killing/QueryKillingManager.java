@@ -18,29 +18,35 @@
  */
 package org.apache.pinot.core.query.killing;
 
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.pinot.common.metrics.ServerMeter;
 import org.apache.pinot.common.metrics.ServerMetrics;
 import org.apache.pinot.core.accounting.QueryMonitorConfig;
 import org.apache.pinot.core.query.killing.strategy.ScanEntriesThresholdStrategy;
-import org.apache.pinot.spi.config.table.QueryConfig;
+import org.apache.pinot.spi.config.provider.PinotClusterConfigChangeListener;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.query.QueryExecutionContext;
 import org.apache.pinot.spi.query.QueryScanCostContext;
+import org.apache.pinot.spi.utils.CommonConstants;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
 /**
- * Central manager for scan-based query killing. Owns the guard rails and delegates the
- * actual kill decision to a {@link QueryKillingStrategy}.
+ * Central manager for scan-based query killing.
  *
- * The default factory is {@link ScanEntriesThresholdStrategy.Factory}, which reads
- * scan thresholds from {@link QueryMonitorConfig}. Custom factories can be configured
- * via {@code accounting.scan.based.killing.strategy.factory.class.name}.
+ * <p>The strategy is built once at init via a {@link QueryKillingStrategyFactory}
+ * and rebuilt when config changes. The default factory is
+ * {@link ScanEntriesThresholdStrategy.Factory}.</p>
  *
+ * <p>Guard rails: enabled check, duplicate-kill prevention, log-only mode,
+ * framework isolation (try-catch around all evaluation).</p>
  */
-public class QueryKillingManager {
+public class QueryKillingManager implements PinotClusterConfigChangeListener {
   private static final Logger LOGGER = LoggerFactory.getLogger(QueryKillingManager.class);
 
   private static volatile QueryKillingManager _instance;
@@ -48,10 +54,6 @@ public class QueryKillingManager {
   private final AtomicReference<QueryMonitorConfig> _configRef;
   private final ServerMetrics _serverMetrics;
 
-  /**
-   * Null if: killing is disabled, config is insufficient, or factory failed to load.
-   * Rebuilt when config changes via {@link #rebuildStrategy()}.
-   */
   @Nullable
   private volatile QueryKillingStrategy _strategy;
 
@@ -61,13 +63,17 @@ public class QueryKillingManager {
   }
 
   /**
-   * Initializes the singleton instance and builds the strategy from config.
-   * Called once during server startup.
+   * Initializes the singleton from a scheduler PinotConfiguration.
+   * Called from BaseServerStarter during server startup — independent of accounting factory.
    */
-  public static void init(AtomicReference<QueryMonitorConfig> configRef, ServerMetrics serverMetrics) {
+  public static QueryKillingManager init(PinotConfiguration schedulerConfig, ServerMetrics serverMetrics) {
+    long maxHeapSize = Runtime.getRuntime().maxMemory();
+    QueryMonitorConfig config = new QueryMonitorConfig(schedulerConfig, maxHeapSize);
+    AtomicReference<QueryMonitorConfig> configRef = new AtomicReference<>(config);
     QueryKillingManager manager = new QueryKillingManager(configRef, serverMetrics);
     manager.rebuildStrategy();
     _instance = manager;
+    return manager;
   }
 
   @Nullable
@@ -77,7 +83,7 @@ public class QueryKillingManager {
 
   /**
    * Rebuilds the strategy from the current config. Called at init and when
-   * cluster config changes (via the same onChange path that rebuilds QueryMonitorConfig).
+   * cluster config changes via {@link #onChange}.
    */
   public void rebuildStrategy() {
     QueryMonitorConfig config = _configRef.get();
@@ -102,10 +108,35 @@ public class QueryKillingManager {
   }
 
   /**
-   * Loads the strategy factory from config. If a custom factory class name is configured,
-   * loads it by reflection (following the same pattern as {@code ThreadAccountantUtils.createAccountant()}).
-   * Otherwise, returns the default {@link ScanEntriesThresholdStrategy.Factory}.
+   * Handles dynamic ZK config changes. Rebuilds QueryMonitorConfig and strategy.
    */
+  @Override
+  public synchronized void onChange(Set<String> changedConfigs, Map<String, String> clusterConfigs) {
+    Set<String> filteredChangedConfigs = changedConfigs.stream()
+        .filter(c -> c.startsWith(CommonConstants.PINOT_QUERY_SCHEDULER_PREFIX))
+        .map(c -> c.replace(CommonConstants.PINOT_QUERY_SCHEDULER_PREFIX + ".", ""))
+        .collect(Collectors.toSet());
+
+    if (filteredChangedConfigs.isEmpty()) {
+      return;
+    }
+
+    Map<String, String> filteredClusterConfigs = clusterConfigs.entrySet().stream()
+        .filter(e -> e.getKey().startsWith(CommonConstants.PINOT_QUERY_SCHEDULER_PREFIX))
+        .collect(Collectors.toMap(
+            e -> e.getKey().replace(CommonConstants.PINOT_QUERY_SCHEDULER_PREFIX + ".", ""),
+            Map.Entry::getValue));
+
+    QueryMonitorConfig oldConfig = _configRef.get();
+    QueryMonitorConfig newConfig = new QueryMonitorConfig(oldConfig, filteredChangedConfigs, filteredClusterConfigs);
+    _configRef.set(newConfig);
+    rebuildStrategy();
+    LOGGER.info("Scan-based killing config updated: mode={}, maxEntriesScannedInFilter={}, maxDocsScanned={}",
+        newConfig.getScanBasedKillingMode(),
+        newConfig.getScanBasedKillingMaxEntriesScannedInFilter(),
+        newConfig.getScanBasedKillingMaxDocsScanned());
+  }
+
   private QueryKillingStrategyFactory loadFactory(QueryMonitorConfig config) {
     String factoryClassName = config.getScanBasedKillingStrategyFactoryClassName();
     if (factoryClassName != null && !factoryClassName.isEmpty()) {
@@ -121,24 +152,35 @@ public class QueryKillingManager {
     return new ScanEntriesThresholdStrategy.Factory();
   }
 
-  /**
-   * Returns the active strategy. Visible for testing.
-   */
   @Nullable
   public QueryKillingStrategy getActiveStrategy() {
     return _strategy;
   }
 
   /**
-   * Evaluates whether the query should be killed based on the active strategy.
-   *
-   * <p>Calls {@link QueryKillingStrategy#forQuery(QueryConfig, QueryMonitorConfig)}
-   * to resolve table-level overrides before evaluating.</p>
+   * Resolves the per-query strategy with table-level overrides applied.
+   * Called once at query init, result is cached on QueryExecutionContext.
+   */
+  @Nullable
+  public QueryKillingStrategy resolveQueryStrategy(
+      @Nullable org.apache.pinot.spi.config.table.QueryConfig queryConfig) {
+    QueryKillingStrategy strategy = _strategy;
+    if (strategy == null) {
+      return null;
+    }
+    QueryMonitorConfig config = _configRef.get();
+    if (config == null || !config.isScanBasedKillingEnabled()) {
+      return null;
+    }
+    return strategy.forQuery(queryConfig, config);
+  }
+
+  /**
+   * Convenience overload called from BaseOperator.checkTermination().
+   * Reads cached strategy from the execution context.
    */
   public void checkAndKillIfNeeded(QueryExecutionContext executionContext,
-      QueryScanCostContext scanCostContext, String queryId, String tableName,
-      @Nullable QueryConfig queryConfig) {
-    // no strategy means killing is disabled or unconfigured
+      QueryScanCostContext scanCostContext) {
     QueryKillingStrategy strategy = _strategy;
     if (strategy == null) {
       return;
@@ -149,32 +191,85 @@ public class QueryKillingManager {
       return;
     }
 
-    // Prevent duplicate kills
     if (executionContext.getTerminateException() != null) {
       return;
     }
 
     try {
-      // Resolve per-query table overrides (returns same instance if no overrides)
-      QueryKillingStrategy queryStrategy = strategy.forQuery(queryConfig, config);
+      QueryKillingStrategy queryStrategy;
+      String configSource;
+      Object cached = executionContext.getCachedKillingStrategy();
+      if (cached instanceof QueryKillingStrategy) {
+        queryStrategy = (QueryKillingStrategy) cached;
+        configSource = (queryStrategy != strategy) ? "table:" + executionContext.getTableName() : "cluster";
+      } else {
+        queryStrategy = strategy;
+        configSource = "cluster";
+      }
 
-      String configSource = (queryStrategy != strategy) ? "table:" + tableName : "cluster";
-
-      // Delegate to strategy
       if (!queryStrategy.shouldTerminate(scanCostContext)) {
         return;
       }
 
-      QueryKillReport report = queryStrategy.buildKillReport(
-          scanCostContext, queryId, tableName, configSource);
+      String queryId = executionContext.getQueryId() != null ? executionContext.getQueryId() : "unknown";
+      String tableName = executionContext.getTableName() != null ? executionContext.getTableName() : "unknown";
+      long requestId = executionContext.getRequestId();
+
+      QueryKillReport report = queryStrategy.buildKillReport(scanCostContext, requestId, queryId, tableName,
+          configSource);
 
       if (config.isScanBasedKillingLogOnly()) {
-        LOGGER.info("Query killed in LogOnly mode: {}", report.toInternalLogMessage());
+        LOGGER.info("SCAN_KILL_DRY_RUN: {}", report.toInternalLogMessage());
         _serverMetrics.addMeteredGlobalValue(ServerMeter.QUERIES_KILLED_SCAN_DRY_RUN, 1);
         return;
       }
 
-      LOGGER.warn("Query Killed in enforce mode: {}", report.toInternalLogMessage());
+      LOGGER.warn("SCAN_KILL: {}", report.toInternalLogMessage());
+      executionContext.terminate(queryStrategy.getErrorCode(), report.toCustomerMessage());
+      _serverMetrics.addMeteredGlobalValue(ServerMeter.QUERIES_KILLED_SCAN, 1);
+    } catch (Exception e) {
+      LOGGER.error("Error in scan-based killing evaluation for query {}", executionContext.getQueryId(), e);
+    }
+  }
+
+  /**
+   * Full-parameter overload for direct calls (e.g., from tests).
+   */
+  public void checkAndKillIfNeeded(QueryExecutionContext executionContext,
+      QueryScanCostContext scanCostContext, String queryId, String tableName,
+      @Nullable org.apache.pinot.spi.config.table.QueryConfig queryConfig) {
+    QueryKillingStrategy strategy = _strategy;
+    if (strategy == null) {
+      return;
+    }
+
+    QueryMonitorConfig config = _configRef.get();
+    if (config == null || !config.isScanBasedKillingEnabled()) {
+      return;
+    }
+
+    if (executionContext.getTerminateException() != null) {
+      return;
+    }
+
+    try {
+      QueryKillingStrategy queryStrategy = strategy.forQuery(queryConfig, config);
+      String configSource = (queryStrategy != strategy) ? "table:" + tableName : "cluster";
+
+      if (!queryStrategy.shouldTerminate(scanCostContext)) {
+        return;
+      }
+
+      QueryKillReport report = queryStrategy.buildKillReport(scanCostContext, executionContext.getRequestId(),
+          queryId, tableName, configSource);
+
+      if (config.isScanBasedKillingLogOnly()) {
+        LOGGER.info("SCAN_KILL_DRY_RUN: {}", report.toInternalLogMessage());
+        _serverMetrics.addMeteredGlobalValue(ServerMeter.QUERIES_KILLED_SCAN_DRY_RUN, 1);
+        return;
+      }
+
+      LOGGER.warn("SCAN_KILL: {}", report.toInternalLogMessage());
       executionContext.terminate(queryStrategy.getErrorCode(), report.toCustomerMessage());
       _serverMetrics.addMeteredGlobalValue(ServerMeter.QUERIES_KILLED_SCAN, 1);
     } catch (Exception e) {

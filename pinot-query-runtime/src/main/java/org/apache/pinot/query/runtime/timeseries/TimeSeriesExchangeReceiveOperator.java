@@ -162,6 +162,47 @@ public class TimeSeriesExchangeReceiveOperator extends BaseTimeSeriesOperator {
         Preconditions.checkState(timeBuckets.equals(blockToMerge.getTimeBuckets()),
             "Found unequal time buckets from server response");
       }
+      // #region agent log
+      try {
+        double blockSum = 0;
+        int blockDataPoints = 0;
+        Double blockLastBucketMax = null;
+        for (var se : blockToMerge.getSeriesMap().entrySet()) {
+          for (TimeSeries ts : se.getValue()) {
+            Double[] vals = ts.getDoubleValues();
+            for (int vi = 0; vi < vals.length; vi++) {
+              if (vals[vi] != null) {
+                blockSum += vals[vi];
+                blockDataPoints++;
+                if (vi == vals.length - 1) {
+                  blockLastBucketMax = (blockLastBucketMax == null) ? vals[vi] : Math.max(blockLastBucketMax, vals[vi]);
+                }
+              }
+            }
+          }
+        }
+        String aggInfoStr = _aggInfo != null ? _aggInfo.getAggFunction() : "null";
+        String logLine = "{\"sessionId\":\"36d59f\",\"id\":\"exch_recv_" + System.nanoTime() + "\","
+            + "\"timestamp\":" + System.currentTimeMillis() + ","
+            + "\"location\":\"TimeSeriesExchangeReceiveOperator.java:getNextBlockWithAggregation\","
+            + "\"message\":\"Exchange receive block from server\","
+            + "\"data\":{\"serverIndex\":" + index
+            + ",\"numServersQueried\":" + _numServersQueried
+            + ",\"numSeries\":" + blockToMerge.getSeriesMap().size()
+            + ",\"blockSum\":" + blockSum
+            + ",\"blockDataPoints\":" + blockDataPoints
+            + ",\"blockLastBucketMax\":" + blockLastBucketMax
+            + ",\"aggInfo\":\"" + aggInfoStr + "\""
+            + ",\"queueSize\":" + _receiver.size()
+            + "},\"hypothesisId\":\"H3_H5\"}";
+        try (java.io.FileWriter fw = new java.io.FileWriter(
+            "/Users/anurag.rai/Uber/anuragrai16/pinot/.cursor/debug-36d59f.log", true)) {
+          fw.write(logLine + "\n");
+        }
+      } catch (Throwable logErr) {
+        // ignore
+      }
+      // #endregion
       // Step-3: Merge new block with existing block.
       for (var entry : blockToMerge.getSeriesMap().entrySet()) {
         long seriesHash = entry.getKey();
@@ -191,6 +232,44 @@ public class TimeSeriesExchangeReceiveOperator extends BaseTimeSeriesOperator {
       seriesMap.put(seriesHash, timeSeriesList);
     }
     TimeSeriesBlock resultBlock = new TimeSeriesBlock(timeBuckets, seriesMap, aggregatedStats);
+    // #region agent log
+    try {
+      double finalSum = 0;
+      Double finalLastBucketMax = null;
+      for (var se : seriesMap.entrySet()) {
+        for (TimeSeries ts : se.getValue()) {
+          Double[] vals = ts.getDoubleValues();
+          for (int vi = 0; vi < vals.length; vi++) {
+            if (vals[vi] != null) {
+              finalSum += vals[vi];
+              if (vi == vals.length - 1) {
+                finalLastBucketMax = (finalLastBucketMax == null) ? vals[vi] : Math.max(finalLastBucketMax, vals[vi]);
+              }
+            }
+          }
+        }
+      }
+      String aggInfoStr = _aggInfo != null ? _aggInfo.getAggFunction() : "null";
+      String logLine = "{\"sessionId\":\"36d59f\",\"id\":\"exch_final_" + System.nanoTime() + "\","
+          + "\"timestamp\":" + System.currentTimeMillis() + ","
+          + "\"location\":\"TimeSeriesExchangeReceiveOperator.java:getNextBlockWithAggregation\","
+          + "\"message\":\"Exchange final aggregated block\","
+          + "\"data\":{\"numServersQueried\":" + _numServersQueried
+          + ",\"timedOut\":" + (timeoutException != null)
+          + ",\"numSeries\":" + seriesMap.size()
+          + ",\"finalSum\":" + finalSum
+          + ",\"finalLastBucketMax\":" + finalLastBucketMax
+          + ",\"aggInfo\":\"" + aggInfoStr + "\""
+          + ",\"remainingInQueue\":" + _receiver.size()
+          + "},\"hypothesisId\":\"H3_H5\"}";
+      try (java.io.FileWriter fw = new java.io.FileWriter(
+          "/Users/anurag.rai/Uber/anuragrai16/pinot/.cursor/debug-36d59f.log", true)) {
+        fw.write(logLine + "\n");
+      }
+    } catch (Throwable logErr) {
+      // ignore
+    }
+    // #endregion
     // Add all collected exceptions to the result block
     allExceptions.forEach(resultBlock::addToExceptions);
     if (timeoutException != null) {

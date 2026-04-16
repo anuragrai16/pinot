@@ -64,6 +64,37 @@ public class TimeSeriesQueryDispatcher {
     BaseTimeSeriesPlanNode brokerFragment = plan.getBrokerFragment();
     Map<String, BlockingQueue<Object>> receiversByPlanId = new HashMap<>();
     populateConsumers(brokerFragment, receiversByPlanId);
+    // #region agent log
+    try {
+      StringBuilder exchangeInfo = new StringBuilder("[");
+      int idx = 0;
+      for (var e : plan.getNumInputServersForExchangePlanNode().entrySet()) {
+        if (idx++ > 0) {
+          exchangeInfo.append(",");
+        }
+        exchangeInfo.append("{\"exchangeId\":\"").append(e.getKey())
+            .append("\",\"numServers\":").append(e.getValue()).append("}");
+      }
+      exchangeInfo.append("]");
+      String logLine = "{\"sessionId\":\"36d59f\",\"id\":\"dispatch_" + System.nanoTime() + "\","
+          + "\"timestamp\":" + System.currentTimeMillis() + ","
+          + "\"location\":\"TimeSeriesQueryDispatcher.java:submitAndGet\","
+          + "\"message\":\"Dispatch plan details\","
+          + "\"data\":{\"requestId\":" + requestId
+          + ",\"numServerFragments\":" + plan.getSerializedServerFragments().size()
+          + ",\"numQueryServers\":" + plan.getQueryServerInstances().size()
+          + ",\"numExchangeNodes\":" + receiversByPlanId.size()
+          + ",\"exchangeNodes\":" + exchangeInfo
+          + ",\"tables\":\"" + String.join(",", plan.getTableNames()) + "\""
+          + "},\"hypothesisId\":\"H2_H3\"}";
+      try (java.io.FileWriter fw = new java.io.FileWriter(
+          "/Users/anurag.rai/Uber/anuragrai16/pinot/.cursor/debug-36d59f.log", true)) {
+        fw.write(logLine + "\n");
+      }
+    } catch (Throwable logErr) {
+      // ignore
+    }
+    // #endregion
     TimeSeriesExecutionContext brokerExecutionContext =
         new TimeSeriesExecutionContext(plan.getLanguage(), plan.getTimeBuckets(), deadlineMs, Map.of(), Map.of(),
             receiversByPlanId);

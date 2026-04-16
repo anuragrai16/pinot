@@ -59,6 +59,8 @@ import org.apache.pinot.core.plan.Plan;
 import org.apache.pinot.core.plan.maker.PlanMaker;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
 import org.apache.pinot.core.query.config.SegmentPrunerConfig;
+import org.apache.pinot.core.query.killing.QueryKillingManager;
+import org.apache.pinot.core.query.killing.QueryKillingStrategy;
 import org.apache.pinot.core.query.pruner.SegmentPrunerService;
 import org.apache.pinot.core.query.pruner.SegmentPrunerStatistics;
 import org.apache.pinot.core.query.request.ServerQueryRequest;
@@ -68,14 +70,19 @@ import org.apache.pinot.core.query.request.context.utils.QueryContextConverterUt
 import org.apache.pinot.core.query.utils.idset.IdSet;
 import org.apache.pinot.core.util.trace.TraceContext;
 import org.apache.pinot.segment.local.data.manager.SegmentDataManager;
+import org.apache.pinot.segment.local.data.manager.TableDataManager;
 import org.apache.pinot.segment.spi.AggregationFunctionType;
 import org.apache.pinot.segment.spi.IndexSegment;
 import org.apache.pinot.segment.spi.SegmentContext;
+import org.apache.pinot.spi.config.table.QueryConfig;
+import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.exception.QueryCancelledException;
 import org.apache.pinot.spi.exception.QueryErrorCode;
 import org.apache.pinot.spi.exception.QueryException;
 import org.apache.pinot.spi.plugin.PluginManager;
+import org.apache.pinot.spi.query.QueryExecutionContext;
+import org.apache.pinot.spi.query.QueryScanCostContext;
 import org.apache.pinot.spi.query.QueryThreadContext;
 import org.apache.pinot.spi.trace.Tracer;
 import org.apache.pinot.spi.trace.Tracing;
@@ -175,6 +182,9 @@ public class ServerQueryExecutorV1Impl implements QueryExecutor {
     queryContext.setEndTimeMs(queryEndTimeMs);
 
     queryContext.setEnablePrefetch(_enablePrefetch);
+
+    // Initialize scan-based query killing for this query
+    initScanBasedKilling(queryRequest, tableNameWithType);
 
     // Query scheduler wait time already exceeds query timeout, directly return
     long querySchedulingTimeMs = System.currentTimeMillis() - queryArrivalTimeMs;
@@ -638,5 +648,48 @@ public class ServerQueryExecutorV1Impl implements QueryExecutor {
     InstanceResponseBlock result = executeDescribeExplain(queryPlan, queryContext);
     planExecTimer.stopAndRecord();
     return result;
+  }
+
+  /**
+   * Initializes scan-based query killing for a query. Sets up the QueryScanCostContext
+   * on the QueryExecutionContext (via QueryThreadContext) so that operators can push
+   * scan cost deltas and BaseOperator.checkTermination() can evaluate thresholds.
+   */
+  private void initScanBasedKilling(ServerQueryRequest queryRequest, String tableNameWithType) {
+    QueryKillingManager killingManager = QueryKillingManager.getInstance();
+    if (killingManager == null) {
+      return;
+    }
+    QueryKillingStrategy strategy = killingManager.getActiveStrategy();
+    if (strategy == null) {
+      return;
+    }
+
+    QueryThreadContext ctx = QueryThreadContext.getIfAvailable();
+    if (ctx == null) {
+      return;
+    }
+    QueryExecutionContext execCtx = ctx.getExecutionContext();
+
+    // Store table name and query ID for kill report logging
+    execCtx.setTableName(tableNameWithType);
+    execCtx.setQueryId(queryRequest.getQueryId());
+
+    // Allocate the scan cost context
+    execCtx.setQueryScanCostContext(new QueryScanCostContext());
+
+    // Resolve per-query strategy with table-level overrides (cached for the query lifetime)
+    TableDataManager tableDataManager = _instanceDataManager.getTableDataManager(tableNameWithType);
+    QueryConfig queryConfig = null;
+    if (tableDataManager != null) {
+      TableConfig tableConfig = tableDataManager.getCachedTableConfigAndSchema().getLeft();
+      if (tableConfig != null) {
+        queryConfig = tableConfig.getQueryConfig();
+      }
+    }
+    QueryKillingStrategy queryStrategy = killingManager.resolveQueryStrategy(queryConfig);
+    if (queryStrategy != null) {
+      execCtx.setCachedKillingStrategy(queryStrategy);
+    }
   }
 }

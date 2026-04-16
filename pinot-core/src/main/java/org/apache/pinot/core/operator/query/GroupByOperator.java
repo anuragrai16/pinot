@@ -42,6 +42,8 @@ import org.apache.pinot.core.query.aggregation.groupby.DefaultGroupByExecutor;
 import org.apache.pinot.core.query.aggregation.groupby.GroupByExecutor;
 import org.apache.pinot.core.query.request.context.QueryContext;
 import org.apache.pinot.core.startree.executor.StarTreeGroupByExecutor;
+import org.apache.pinot.spi.query.QueryScanCostContext;
+import org.apache.pinot.spi.query.QueryThreadContext;
 import org.apache.pinot.spi.trace.Tracing;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -118,7 +120,12 @@ public class GroupByOperator extends BaseOperator<GroupByResultsBlock> {
     ValueBlock valueBlock;
 
     while ((valueBlock = _projectOperator.nextBlock()) != null) {
-      _numDocsScanned += valueBlock.getNumDocs();
+      int numDocs = valueBlock.getNumDocs();
+      _numDocsScanned += numDocs;
+      QueryScanCostContext scanCost = getScanCostContext();
+      if (scanCost != null) {
+        scanCost.addDocsScanned(numDocs);
+      }
       groupByExecutor.process(valueBlock);
     }
 
@@ -236,5 +243,11 @@ public class GroupByOperator extends BaseOperator<GroupByResultsBlock> {
         .map(AggregationFunction::toExplainString)
         .collect(Collectors.toList());
     attributeBuilder.putStringList("aggregations", aggregations);
+  }
+
+  @javax.annotation.Nullable
+  private static QueryScanCostContext getScanCostContext() {
+    QueryThreadContext ctx = QueryThreadContext.getIfAvailable();
+    return ctx != null ? ctx.getExecutionContext().getQueryScanCostContext() : null;
   }
 }

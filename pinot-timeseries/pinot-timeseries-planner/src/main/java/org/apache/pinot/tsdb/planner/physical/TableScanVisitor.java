@@ -67,12 +67,49 @@ public class TableScanVisitor {
           compileBrokerRequest(sfpNode.getTableName(), filterExpression),
           context._requestId);
       Preconditions.checkNotNull(routingTable, "Failed to get routing table for table: " + sfpNode.getTableName());
+      // #region agent log
+      int totalSegments = 0;
+      int serverCount = 0;
+      StringBuilder serverSegCounts = new StringBuilder("[");
+      // #endregion
       for (var entry : routingTable.getServerInstanceToSegmentsMap().entrySet()) {
         ServerInstance serverInstance = entry.getKey();
         List<String> segments = entry.getValue().getSegments();
         context.getLeafIdToSegmentsByServer().computeIfAbsent(serverInstance, (x) -> new HashMap<>())
             .put(sfpNode.getId(), segments);
+        // #region agent log
+        if (serverCount > 0) {
+          serverSegCounts.append(",");
+        }
+        serverSegCounts.append("{\"server\":\"").append(serverInstance.getInstanceId())
+            .append("\",\"segCount\":").append(segments.size()).append("}");
+        totalSegments += segments.size();
+        serverCount++;
+        // #endregion
       }
+      // #region agent log
+      serverSegCounts.append("]");
+      try {
+        String logLine = "{\"sessionId\":\"36d59f\",\"id\":\"seg_assign_" + System.nanoTime() + "\","
+            + "\"timestamp\":" + System.currentTimeMillis() + ","
+            + "\"location\":\"TableScanVisitor.java:assignSegmentsToPlan\","
+            + "\"message\":\"Segment assignment for leaf\","
+            + "\"data\":{\"leafId\":\"" + sfpNode.getId() + "\""
+            + ",\"table\":\"" + sfpNode.getTableName() + "\""
+            + ",\"requestId\":" + context._requestId
+            + ",\"serverCount\":" + serverCount
+            + ",\"totalSegments\":" + totalSegments
+            + ",\"unavailableSegments\":" + routingTable.getUnavailableSegments().size()
+            + ",\"serverSegments\":" + serverSegCounts
+            + "},\"hypothesisId\":\"H2\"}";
+        try (java.io.FileWriter fw = new java.io.FileWriter(
+            "/Users/anurag.rai/Uber/anuragrai16/pinot/.cursor/debug-36d59f.log", true)) {
+          fw.write(logLine + "\n");
+        }
+      } catch (Throwable logErr) {
+        // ignore
+      }
+      // #endregion
     }
     for (BaseTimeSeriesPlanNode childNode : planNode.getInputs()) {
       assignSegmentsToPlan(childNode, timeBuckets, context);
